@@ -18,6 +18,7 @@
 #include <PMIC_BQ25896.h>
 #include <BQ27220.h>
 #include <esp_heap_caps.h>
+#include <stdarg.h>
 
 // Shared pin map
 static const int PIN_I2C_SDA = 48;
@@ -79,6 +80,49 @@ static bool gSdMounted = false;
 static bool gExpanderReady = false;
 static uint16_t gExpanderOutput = 0x0000;
 static uint16_t gExpanderConfig = 0xFFFF;
+static int gScreenLogLine = 0;
+static const int SCREEN_LOG_LINE_H = 18;
+static const int SCREEN_LOG_MARGIN = 8;
+
+static void screenLog(const char *msg) {
+  if (gGfx == nullptr || msg == nullptr) {
+    return;
+  }
+
+  int maxLines = (DSP_VER_RES - SCREEN_LOG_MARGIN * 2) / SCREEN_LOG_LINE_H;
+  if (maxLines < 1) {
+    maxLines = 1;
+  }
+
+  if (gScreenLogLine >= maxLines) {
+    gGfx->fillScreen(0x0000);
+    gScreenLogLine = 0;
+  }
+
+  int y = SCREEN_LOG_MARGIN + gScreenLogLine * SCREEN_LOG_LINE_H;
+  gGfx->setTextColor(0xFFFF, 0x0000);
+  gGfx->setTextSize(2);
+  gGfx->setCursor(SCREEN_LOG_MARGIN, y);
+  gGfx->println(msg);
+  gScreenLogLine++;
+}
+
+static void logBoth(const char *msg) {
+  if (msg == nullptr) {
+    return;
+  }
+  Serial.println(msg);
+  screenLog(msg);
+}
+
+static void logBothf(const char *fmt, ...) {
+  char buf[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  logBoth(buf);
+}
 
 volatile bool gExpanderInterrupted = false;
 volatile bool gButtonUpInterrupted = false;
@@ -710,21 +754,40 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  setupDisplayIfNeeded();
+  if (gGfx != nullptr) {
+    gGfx->fillScreen(0x0000);
+    gScreenLogLine = 0;
+    screenLog("KODE all-in-one test");
+  }
+
   printBanner("KODE all-in-one test start");
+  screenLog("Start all tests");
 
   test1Esp32Info();
+  screenLog("[DONE] 1 ESP32 info");
   test2IoExpander();
+  screenLog("[DONE] 2 IO expander");
   test4RgbLed();
+  screenLog("[DONE] 4 RGB LED");
   test5Buttons();
+  screenLog("[DONE] 5 Buttons");
   test6MicroSd();
+  screenLog("[DONE] 6 microSD");
   test7Audio();
+  screenLog("[DONE] 7 Audio");
   test3DisplayAndLvgl();
+  screenLog("[DONE] 3 Display+LVGL");
   test8ImuAndMag();
+  screenLog("[DONE] 8 IMU+MAG");
   test9Rtc();
+  screenLog("[DONE] 9 RTC");
   test10Power();
+  screenLog("[DONE] 10 Power");
 
   printBanner("All tests finished");
   Serial.println("Loop keeps LVGL alive and prints heartbeat every 5s.");
+  screenLog("All tests finished");
 }
 
 void loop() {
@@ -736,7 +799,7 @@ void loop() {
 
   if (millis() - lastHeartbeat > 5000) {
     lastHeartbeat = millis();
-    Serial.println("all-in-one running...");
+    logBoth("all-in-one running...");
   }
 
   delay(5);
