@@ -50,6 +50,8 @@ static const int DSP_SDIO3 = 10;
 static const int DSP_RST = 8;
 static const int DSP_CS = 9;
 static const int DSP_BL = 22;
+static const int TOUCH_OFFSET_X = 0;
+static const int TOUCH_OFFSET_Y = -40;
 
 static const uint32_t TEST_WINDOW_MS = 3000;
 
@@ -93,9 +95,9 @@ static const int UI_LOG_BUFFER_SIZE = 4096;
 static const bool FORCE_EXP4_LOW_TEST = false;
 static const int UI_SCALE_MENU_TITLE = 384;
 static const int UI_SCALE_MENU_BUTTON_TEXT = 320;
-static const int UI_SCALE_RUN_TITLE = 384;
-static const int UI_SCALE_RUN_STATUS = 512;
-static const int UI_SCALE_RUN_LOG = 512;
+static const int UI_SCALE_RUN_TITLE = 256;
+static const int UI_SCALE_RUN_STATUS = 256;
+static const int UI_SCALE_RUN_LOG = 256;
 
 typedef void (*TestMenuRunner)();
 
@@ -106,7 +108,6 @@ struct TestMenuEntry {
 
 static void test1Esp32Info();
 static void test2IoExpander();
-static void test3DisplayAndLvgl();
 static void test4RgbLed();
 static void test5Buttons();
 static void test6MicroSd();
@@ -118,14 +119,13 @@ static void test10Power();
 static const TestMenuEntry kTestMenuEntries[] = {
   {"[1] ESP32 Info", test1Esp32Info},
   {"[2] IO Expander", test2IoExpander},
-  {"[3] Display + Touch", test3DisplayAndLvgl},
-  {"[4] RGB LED", test4RgbLed},
-  {"[5] Buttons", test5Buttons},
-  {"[6] microSD", test6MicroSd},
-  {"[7] Audio", test7Audio},
-  {"[8] IMU + MAG", test8ImuAndMag},
-  {"[9] RTC", test9Rtc},
-  {"[10] Power", test10Power},
+  {"[3] RGB LED", test4RgbLed},
+  {"[4] Buttons", test5Buttons},
+  {"[5] microSD", test6MicroSd},
+  {"[6] Audio", test7Audio},
+  {"[7] IMU + MAG", test8ImuAndMag},
+  {"[8] RTC", test9Rtc},
+  {"[9] Power", test10Power},
 };
 
 static lv_obj_t *gMenuScreen = nullptr;
@@ -178,6 +178,56 @@ static const lv_font_t *uiTitleFont() {
 
 static const lv_font_t *uiBodyFont() {
   return LV_FONT_DEFAULT;
+}
+
+static int clampPercent(int value) {
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 100) {
+    return 100;
+  }
+  return value;
+}
+
+static int absoluteInt(int value) {
+  return value < 0 ? -value : value;
+}
+
+static int estimateBatteryPercentFromVoltage(int millivolts) {
+  struct BatterySocPoint {
+    int millivolts;
+    int percent;
+  };
+
+  static const BatterySocPoint kCurve[] = {
+    {3300, 0},
+    {3600, 10},
+    {3700, 20},
+    {3750, 35},
+    {3800, 50},
+    {3900, 70},
+    {4000, 85},
+    {4100, 95},
+    {4200, 100},
+  };
+
+  if (millivolts <= kCurve[0].millivolts) {
+    return kCurve[0].percent;
+  }
+
+  for (size_t i = 1; i < sizeof(kCurve) / sizeof(kCurve[0]); ++i) {
+    if (millivolts <= kCurve[i].millivolts) {
+      int mv0 = kCurve[i - 1].millivolts;
+      int mv1 = kCurve[i].millivolts;
+      int soc0 = kCurve[i - 1].percent;
+      int soc1 = kCurve[i].percent;
+      long numerator = (long)(millivolts - mv0) * (soc1 - soc0);
+      return clampPercent(soc0 + (int)(numerator / (mv1 - mv0)));
+    }
+  }
+
+  return 100;
 }
 
 static void clearRunLog() {
@@ -736,9 +786,16 @@ static void lvglTouchReadCb(lv_indev_t *indev, lv_indev_data_t *data) {
 
   TOUCHINFO ti;
   if (gTouch.getSamples(&ti) && ti.count > 0) {
+    int touchX = ti.x[0] + TOUCH_OFFSET_X;
+    int touchY = ti.y[0] + TOUCH_OFFSET_Y;
+    if (touchX < 0) touchX = 0;
+    if (touchY < 0) touchY = 0;
+    if (touchX >= DSP_HOR_RES) touchX = DSP_HOR_RES - 1;
+    if (touchY >= DSP_VER_RES) touchY = DSP_VER_RES - 1;
+
     data->state = LV_INDEV_STATE_PRESSED;
-    data->point.x = ti.x[0];
-    data->point.y = ti.y[0];
+    data->point.x = touchX;
+    data->point.y = touchY;
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
@@ -970,35 +1027,8 @@ static bool setupDisplayIfNeeded() {
   return true;
 }
 
-static void test3DisplayAndLvgl() {
-  printBanner("[3] Display + LVGL");
-
-  if (!setupLvglIfNeeded()) {
-    logBoth("SKIP: LVGL unavailable");
-    return;
-  }
-
-  // Display test from display_test.ino
-  gGfx->fillScreen(0x001F);
-  gGfx->setTextColor(0xFD20);
-  gGfx->setTextSize(4);
-  gGfx->setCursor(65, 250);
-  gGfx->print("Hello World!");
-  delay(500);
-
-  lv_obj_t *label = lv_label_create(lv_screen_active());
-  lv_label_set_text(label, "LVGL OK");
-  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-
-  uint32_t start = millis();
-  while (millis() - start < 1000) {
-    lv_timer_handler();
-    delay(5);
-  }
-}
-
 static void test4RgbLed() {
-  printBanner("[4] Addressable LED");
+  printBanner("[3] Addressable LED");
 
   gPixel.begin();
   gPixel.clear();
@@ -1021,7 +1051,7 @@ static void test4RgbLed() {
 }
 
 static void test5Buttons() {
-  printBanner("[5] Buttons");
+  printBanner("[4] Buttons");
   if (!setupExpander()) {
     logBoth("SKIP: expander not ready");
     return;
@@ -1066,7 +1096,7 @@ static void test5Buttons() {
 }
 
 static void test6MicroSd() {
-  printBanner("[6] microSD");
+  printBanner("[5] microSD");
   if (!mountSdIfNeeded()) {
     logBoth("SKIP: SD card not available");
     return;
@@ -1117,7 +1147,7 @@ static bool beginI2SMonitor() {
 }
 
 static void test7Audio() {
-  printBanner("[7] Audio (speaker + microphone)");
+  printBanner("[6] Audio (speaker + microphone)");
 
   if (!setupExpander()) {
     logBoth("Expander missing, speaker amplifier may stay disabled");
@@ -1208,7 +1238,7 @@ static void test7Audio() {
 }
 
 static void test8ImuAndMag() {
-  printBanner("[8] IMU + Magnetometer");
+  printBanner("[7] IMU + Magnetometer");
   ensureI2C();
 
   if (gImu.begin_I2C()) {
@@ -1243,7 +1273,7 @@ static void test8ImuAndMag() {
 }
 
 static void test9Rtc() {
-  printBanner("[9] RTC");
+  printBanner("[8] RTC");
   ensureI2C();
 
   gRtc.begin();
@@ -1273,7 +1303,7 @@ static void test9Rtc() {
 }
 
 static void test10Power() {
-  printBanner("[10] Power (PMIC + Fuel Gauge)");
+  printBanner("[9] Power (PMIC + Fuel Gauge)");
   ensureI2C();
 
   gPmic.begin();
@@ -1293,15 +1323,106 @@ static void test10Power() {
     logBoth("PMIC BQ25896 not found");
   }
 
-  if (gGauge.begin()) {
+  if (gGauge.begin(Wire, BQ27220_I2C_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL, 400000U)) {
     int soc = gGauge.readStateOfChargePercent();
     int mv = gGauge.readVoltageMillivolts();
     int ma = gGauge.readCurrentMilliamps();
+    int avgMa = gGauge.readAverageCurrentMilliamps();
     float tC = gGauge.readTemperatureCelsius();
+    int remainingCapacity = gGauge.readRemainingCapacitymAh();
+    int fullChargeCapacity = gGauge.readFullChargeCapacitymAh();
+    int designCapacity = gGauge.readDesignCapacitymAh();
+    int cycleCount = gGauge.readCycleCount();
+    int soh = gGauge.readStateOfHealthPercent();
+    int voltageSoc = estimateBatteryPercentFromVoltage(mv);
+    int capacitySoc = -1;
+    int usableSoc = -1;
+    const char *usableSocSource = "unknown";
+    uint16_t batteryStatus = 0;
+    uint16_t operationStatus = 0;
+    bool batteryStatusOk = gGauge.readBatteryStatus(batteryStatus);
+    bool operationStatusOk = gGauge.readOperationStatus(operationStatus);
+    bool gaugeSocTrusted = true;
 
-    logBothf("BQ27220 SOC=%d%% V=%d I=%d T=%.1fC", soc, mv, ma, tC);
+    if (remainingCapacity >= 0 && fullChargeCapacity > 0) {
+      capacitySoc = clampPercent((remainingCapacity * 100 + fullChargeCapacity / 2) / fullChargeCapacity);
+    }
+
+    logBothf("BQ27220 SOC=%d%% V=%d I=%d IAVG=%d T=%.1fC", soc, mv, ma, avgMa, tC);
+    logBothf("BQ27220 RM=%d FCC=%d DC=%d mAh", remainingCapacity, fullChargeCapacity, designCapacity);
+    logBothf("BQ27220 SOH=%d%% Cycles=%d", soh, cycleCount);
+    if (capacitySoc >= 0) {
+      logBothf("Gauge cross-check: capSOC=%d%% voltSOC~%d%%", capacitySoc, voltageSoc);
+    } else {
+      logBothf("Gauge cross-check: voltSOC~%d%%", voltageSoc);
+    }
+    if (batteryStatusOk) {
+      logBothf("BQ27220 BatteryStatus=0x%04X", batteryStatus);
+    }
+    if (operationStatusOk) {
+      logBothf("BQ27220 OperationStatus=0x%04X", operationStatus);
+    }
+
+    bool suspicious = false;
+    if (designCapacity <= 0 || fullChargeCapacity <= 0) {
+      logBoth("WARN: gauge capacity registers look invalid; profile/config may be missing.");
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+    if (soc < 0 || mv < 0) {
+      logBoth("WARN: gauge read failed; fuel-gauge data is not trustworthy.");
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+    if (!batteryStatusOk || !operationStatusOk) {
+      logBoth("WARN: gauge status registers could not be read completely.");
+      suspicious = true;
+    }
+    if (soc == 0 && mv >= 3600) {
+      logBoth("WARN: SOC is 0% while battery voltage is well above empty; SOC is not trustworthy.");
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+    if (remainingCapacity == 0 && mv >= 3600) {
+      logBoth("WARN: remaining capacity is 0 mAh at a normal cell voltage; gauge learning/profile is likely wrong.");
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+    if (capacitySoc >= 0 && soc >= 0 && absoluteInt(capacitySoc - soc) > 20) {
+      logBothf("WARN: SOC mismatch, gauge=%d%% capacity=%d%%.", soc, capacitySoc);
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+    if (soc >= 0 && absoluteInt(voltageSoc - soc) > 35 && mv >= 3500 && mv <= 4100) {
+      logBothf("WARN: SOC mismatch, gauge=%d%% voltage-est=%d%%.", soc, voltageSoc);
+      suspicious = true;
+      gaugeSocTrusted = false;
+    }
+
+    if (gaugeSocTrusted && soc >= 0) {
+      usableSoc = soc;
+      usableSocSource = "gauge";
+    } else if (capacitySoc >= 0 && remainingCapacity > 0 && fullChargeCapacity > 0 && absoluteInt(capacitySoc - voltageSoc) <= 20) {
+      usableSoc = clampPercent((capacitySoc + voltageSoc) / 2);
+      usableSocSource = "capacity+voltage";
+    } else {
+      usableSoc = voltageSoc;
+      usableSocSource = "voltage-fallback";
+    }
+
+    if (usableSoc >= 0) {
+      logBothf("Usable SOC=%d%% (%s)", usableSoc, usableSocSource);
+    }
+    if (!suspicious) {
+      logBoth("PASS: PMIC and fuel-gauge readings look internally consistent.");
+    } else if (gPmic.isConnected()) {
+      logBoth("RESULT: PMIC path looks good, but gauge SOC/capacity tracking is not trustworthy yet.");
+    }
+
     if (ma > 0) {
       logBothf("BQ27220 TTF=%d min", gGauge.readTimeToFullMinutes());
+    } else if (ma < 0) {
+      logBothf("BQ27220 TTE=%d min", gGauge.readTimeToEmptyMinutes());
     }
   } else {
     logBoth("BQ27220 not found");
