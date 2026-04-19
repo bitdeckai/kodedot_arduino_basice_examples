@@ -90,6 +90,7 @@ static const int SCREEN_LOG_MARGIN = 8;
 static const int UI_SAFE_MARGIN_X = 28;
 static const int UI_SAFE_MARGIN_Y = 34;
 static const int UI_LOG_BUFFER_SIZE = 4096;
+static const bool FORCE_EXP4_LOW_TEST = false;
 static const int UI_SCALE_MENU_TITLE = 384;
 static const int UI_SCALE_MENU_BUTTON_TEXT = 320;
 static const int UI_SCALE_RUN_TITLE = 384;
@@ -149,6 +150,8 @@ static bool gMenuBackPrev = false;
 static uint32_t gSingleButtonPressStartMs = 0;
 static bool gSingleButtonLongHandled = false;
 static bool gSingleButtonModeLogged = false;
+static bool gMenuInputArmed = false;
+static uint32_t gMenuInputReleaseSinceMs = 0;
 
 static bool setupLvglIfNeeded();
 static void showMainMenu();
@@ -158,6 +161,7 @@ static void backButtonEvent(lv_event_t *e);
 static void runPendingMenuTest();
 static bool setupMenuKeysIfNeeded();
 static void refreshMenuSelection();
+static void resetMenuInputLatch();
 static void handleMenuInputFallback();
 static const lv_font_t *uiTitleFont();
 static const lv_font_t *uiBodyFont();
@@ -235,6 +239,18 @@ static void refreshMenuSelection() {
   }
 }
 
+static void resetMenuInputLatch() {
+  gMenuInputArmed = false;
+  gMenuInputReleaseSinceMs = 0;
+  gMenuUpPrev = false;
+  gMenuDownPrev = false;
+  gMenuSelectPrev = false;
+  gMenuBackPrev = false;
+  gSingleButtonPressStartMs = 0;
+  gSingleButtonLongHandled = false;
+  gLastMenuNavMs = millis();
+}
+
 static bool setupMenuKeysIfNeeded() {
   if (gMenuKeysReady) {
     return true;
@@ -261,6 +277,34 @@ static void handleMenuInputFallback() {
   setupMenuKeysIfNeeded();
 
   bool gpioButtonNow = digitalRead(PIN_BUTTON_UP) == LOW;
+  bool allReleased = !gpioButtonNow;
+  if (gExpanderReady) {
+    allReleased = allReleased &&
+                  expanderDigitalRead(6) != LOW &&
+                  expanderDigitalRead(7) != LOW &&
+                  expanderDigitalRead(8) != LOW &&
+                  expanderDigitalRead(9) != LOW &&
+                  expanderDigitalRead(11) != LOW;
+  }
+
+  if (!gMenuInputArmed) {
+    if (allReleased) {
+      if (gMenuInputReleaseSinceMs == 0) {
+        gMenuInputReleaseSinceMs = millis();
+      } else if (millis() - gMenuInputReleaseSinceMs >= 250) {
+        gMenuInputArmed = true;
+      }
+    } else {
+      gMenuInputReleaseSinceMs = 0;
+    }
+
+    gMenuUpPrev = gpioButtonNow;
+    gMenuDownPrev = false;
+    gMenuSelectPrev = false;
+    gMenuBackPrev = false;
+    return;
+  }
+
   if (!gExpanderReady) {
     if (!gSingleButtonModeLogged) {
       Serial.println("Single-button menu mode: short press=next, long press=enter/back");
@@ -411,6 +455,13 @@ static bool setupLvglIfNeeded() {
     return true;
   }
 
+  if (!gExpanderReady) {
+    if (setupExpander()) {
+      Serial.println("Peripheral rail enabled before LVGL/touch init");
+      delay(50);
+    }
+  }
+
   if (!setupDisplayIfNeeded()) {
     return false;
   }
@@ -418,9 +469,9 @@ static bool setupLvglIfNeeded() {
   lv_init();
   lv_tick_set_cb(lvTickMs);
 
-  ensureI2C();
   if (gTouch.init(PIN_I2C_SDA, PIN_I2C_SCL, -1, -1, 400000) == CT_SUCCESS) {
     gTouch.setOrientation(0, DSP_HOR_RES, DSP_VER_RES);
+    gI2cReady = true;
     gTouchReady = true;
     Serial.printf("Touch initialized, type=%d\n", gTouch.sensorType());
   } else {
@@ -632,6 +683,7 @@ static void showMainMenu() {
   }
 
   refreshMenuSelection();
+  resetMenuInputLatch();
   gPendingTestIndex = -1;
   lv_screen_load(gMenuScreen);
   lv_timer_handler();
@@ -802,7 +854,8 @@ static bool setupExpander() {
 
   // Keep peripherals and amplifier powered for later tests.
   if (!expanderPinMode(3, OUTPUT) || !expanderPinMode(4, OUTPUT) ||
-      !expanderDigitalWrite(3, HIGH) || !expanderDigitalWrite(4, HIGH)) {
+      !expanderDigitalWrite(3, HIGH) ||
+      !expanderDigitalWrite(4, FORCE_EXP4_LOW_TEST ? LOW : HIGH)) {
     Serial.println("Expander power pin setup failed");
     return false;
   }
@@ -810,6 +863,16 @@ static bool setupExpander() {
   gExpanderReady = true;
 
   Serial.println("Expander initialized (0x20)");
+  if (FORCE_EXP4_LOW_TEST) {
+    Serial.println("TEST mode: EXP4 forced LOW");
+  }
+  Serial.printf("EXP3 cfg=%u out=%u in=%d | EXP4 cfg=%u out=%u in=%d\n",
+                (unsigned int)((gExpanderConfig >> 3) & 0x1),
+                (unsigned int)((gExpanderOutput >> 3) & 0x1),
+                expanderDigitalRead(3),
+                (unsigned int)((gExpanderConfig >> 4) & 0x1),
+                (unsigned int)((gExpanderOutput >> 4) & 0x1),
+                expanderDigitalRead(4));
   return true;
 }
 
@@ -875,6 +938,13 @@ static bool setupDisplayIfNeeded() {
     return true;
   }
 
+  if (!gExpanderReady) {
+    if (setupExpander()) {
+      Serial.println("Peripheral rail enabled before display init");
+      delay(50);
+    }
+  }
+
   gGfxBus = new Arduino_ESP32QSPI(DSP_CS, DSP_SCLK, DSP_SDIO0, DSP_SDIO1, DSP_SDIO2, DSP_SDIO3);
   gGfx = new Arduino_CO5300(gGfxBus, DSP_RST, 0, DSP_HOR_RES, DSP_VER_RES, DSP_BL, 0, 0, 0);
 
@@ -889,6 +959,12 @@ static bool setupDisplayIfNeeded() {
 
   pinMode(DSP_BL, OUTPUT);
   digitalWrite(DSP_BL, HIGH);
+
+  pinMode(DSP_RST, OUTPUT);
+  digitalWrite(DSP_RST, LOW);
+  delay(10);
+  digitalWrite(DSP_RST, HIGH);
+  delay(20);
 
   Serial.println("Display initialized");
   return true;
