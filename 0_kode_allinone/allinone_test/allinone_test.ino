@@ -19,6 +19,7 @@
 #include <BQ27220.h>
 #include <esp_heap_caps.h>
 #include <stdarg.h>
+#include <string.h>
 
 // Shared pin map
 static const int PIN_I2C_SDA = 48;
@@ -76,6 +77,7 @@ static lv_indev_t *gLvIndev = nullptr;
 static uint8_t *gLvBuf1 = nullptr;
 static uint8_t *gLvBuf2 = nullptr;
 static bool gLvglReady = false;
+static bool gTouchReady = false;
 static bool gSdMounted = false;
 static bool gExpanderReady = false;
 static uint16_t gExpanderOutput = 0x0000;
@@ -83,8 +85,119 @@ static uint16_t gExpanderConfig = 0xFFFF;
 static int gScreenLogLine = 0;
 static const int SCREEN_LOG_LINE_H = 18;
 static const int SCREEN_LOG_MARGIN = 8;
+static const int UI_SAFE_MARGIN_X = 28;
+static const int UI_SAFE_MARGIN_Y = 34;
+static const int UI_LOG_BUFFER_SIZE = 4096;
+
+typedef void (*TestMenuRunner)();
+
+struct TestMenuEntry {
+  const char *label;
+  TestMenuRunner runner;
+};
+
+static void test1Esp32Info();
+static void test2IoExpander();
+static void test3DisplayAndLvgl();
+static void test4RgbLed();
+static void test5Buttons();
+static void test6MicroSd();
+static void test7Audio();
+static void test8ImuAndMag();
+static void test9Rtc();
+static void test10Power();
+
+static const TestMenuEntry kTestMenuEntries[] = {
+  {"[1] ESP32 Info", test1Esp32Info},
+  {"[2] IO Expander", test2IoExpander},
+  {"[3] Display + Touch", test3DisplayAndLvgl},
+  {"[4] RGB LED", test4RgbLed},
+  {"[5] Buttons", test5Buttons},
+  {"[6] microSD", test6MicroSd},
+  {"[7] Audio", test7Audio},
+  {"[8] IMU + MAG", test8ImuAndMag},
+  {"[9] RTC", test9Rtc},
+  {"[10] Power", test10Power},
+};
+
+static lv_obj_t *gMenuScreen = nullptr;
+static lv_obj_t *gMenuPanel = nullptr;
+static lv_obj_t *gRunScreen = nullptr;
+static lv_obj_t *gRunTitle = nullptr;
+static lv_obj_t *gRunStatus = nullptr;
+static lv_obj_t *gRunLogPanel = nullptr;
+static lv_obj_t *gRunLogLabel = nullptr;
+static lv_obj_t *gBackButton = nullptr;
+static lv_obj_t *gBackLabel = nullptr;
+static int gPendingTestIndex = -1;
+static bool gTestRunning = false;
+static char gRunLogText[UI_LOG_BUFFER_SIZE] = {0};
+
+static bool setupLvglIfNeeded();
+static void showMainMenu();
+static void showRunScreen(int testIndex, bool completed);
+static void menuButtonEvent(lv_event_t *e);
+static void backButtonEvent(lv_event_t *e);
+static void runPendingMenuTest();
+static const lv_font_t *uiTitleFont();
+static const lv_font_t *uiBodyFont();
+static void clearRunLog();
+static void appendRunLogLine(const char *msg);
+
+static size_t menuTestCount() {
+  return sizeof(kTestMenuEntries) / sizeof(kTestMenuEntries[0]);
+}
+
+static const lv_font_t *uiTitleFont() {
+  return LV_FONT_DEFAULT;
+}
+
+static const lv_font_t *uiBodyFont() {
+  return LV_FONT_DEFAULT;
+}
+
+static void clearRunLog() {
+  gRunLogText[0] = '\0';
+  gScreenLogLine = 0;
+  if (gRunLogLabel != nullptr) {
+    lv_label_set_text(gRunLogLabel, "");
+  }
+}
+
+static void appendRunLogLine(const char *msg) {
+  if (msg == nullptr || gRunLogLabel == nullptr) {
+    return;
+  }
+
+  size_t currentLen = strlen(gRunLogText);
+  size_t msgLen = strlen(msg);
+  size_t needed = currentLen + msgLen + (currentLen > 0 ? 1 : 0) + 1;
+  if (needed >= UI_LOG_BUFFER_SIZE) {
+    const char *overflow = "...\n";
+    size_t overflowLen = strlen(overflow);
+    memmove(gRunLogText, gRunLogText + (UI_LOG_BUFFER_SIZE / 3), currentLen - (UI_LOG_BUFFER_SIZE / 3) + 1);
+    currentLen = strlen(gRunLogText);
+    if (currentLen + overflowLen + 1 < UI_LOG_BUFFER_SIZE) {
+      strcat(gRunLogText, overflow);
+      currentLen = strlen(gRunLogText);
+    }
+  }
+
+  if (currentLen > 0 && currentLen + 1 < UI_LOG_BUFFER_SIZE) {
+    gRunLogText[currentLen++] = '\n';
+    gRunLogText[currentLen] = '\0';
+  }
+  strncat(gRunLogText, msg, UI_LOG_BUFFER_SIZE - strlen(gRunLogText) - 1);
+  lv_label_set_text(gRunLogLabel, gRunLogText);
+  lv_obj_scroll_to_y(gRunLogPanel, LV_COORD_MAX, LV_ANIM_OFF);
+}
 
 static void screenLog(const char *msg) {
+  if (gTestRunning && gRunLogLabel != nullptr) {
+    appendRunLogLine(msg);
+    return;
+  }
+
   if (gGfx == nullptr || msg == nullptr) {
     return;
   }
@@ -144,6 +257,218 @@ void IRAM_ATTR handleButtonUpIRQ() {
 
 static uint32_t lvTickMs() {
   return millis();
+}
+
+static bool setupLvglIfNeeded() {
+  if (gLvglReady) {
+    return true;
+  }
+
+  if (!setupDisplayIfNeeded()) {
+    return false;
+  }
+
+  lv_init();
+  lv_tick_set_cb(lvTickMs);
+
+  ensureI2C();
+  if (gTouch.init(PIN_I2C_SDA, PIN_I2C_SCL, -1, -1, 400000) == CT_SUCCESS) {
+    gTouch.setOrientation(0, DSP_HOR_RES, DSP_VER_RES);
+    gTouchReady = true;
+    Serial.println("Touch initialized");
+  } else {
+    gTouchReady = false;
+    Serial.println("Touch init failed, continue without touch");
+  }
+
+  gLvDisplay = lv_display_create(DSP_HOR_RES, DSP_VER_RES);
+  lv_display_set_flush_cb(gLvDisplay, lvglFlushCb);
+
+  size_t drawBuf = (DSP_HOR_RES * DSP_VER_RES / 10) * (LV_COLOR_DEPTH / 8);
+  gLvBuf1 = (uint8_t *)heap_caps_malloc(drawBuf, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  gLvBuf2 = (uint8_t *)heap_caps_malloc(drawBuf, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (gLvBuf1 == nullptr || gLvBuf2 == nullptr) {
+    Serial.println("LVGL buffer allocation failed");
+    return false;
+  }
+
+  lv_display_set_buffers(gLvDisplay, gLvBuf1, gLvBuf2, drawBuf, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  gLvIndev = lv_indev_create();
+  lv_indev_set_type(gLvIndev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(gLvIndev, lvglTouchReadCb);
+
+  gLvglReady = true;
+  Serial.println("LVGL initialized");
+  return true;
+}
+
+static void menuButtonEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || gTestRunning) {
+    return;
+  }
+
+  gPendingTestIndex = (int)(intptr_t)lv_event_get_user_data(e);
+}
+
+static void backButtonEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || gTestRunning) {
+    return;
+  }
+
+  showMainMenu();
+}
+
+static void showRunScreen(int testIndex, bool completed) {
+  if (!setupLvglIfNeeded()) {
+    return;
+  }
+
+  if (gRunScreen == nullptr) {
+    gRunScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(gRunScreen, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gRunScreen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(gRunScreen, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gRunScreen, 0, LV_PART_MAIN);
+
+    gRunTitle = lv_label_create(gRunScreen);
+    lv_obj_set_width(gRunTitle, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2);
+    lv_obj_set_pos(gRunTitle, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y);
+    lv_obj_set_style_text_color(gRunTitle, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gRunTitle, uiTitleFont(), LV_PART_MAIN);
+
+    gRunStatus = lv_label_create(gRunScreen);
+    lv_obj_set_width(gRunStatus, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2);
+    lv_obj_set_pos(gRunStatus, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 54);
+    lv_obj_set_style_text_color(gRunStatus, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gRunStatus, uiBodyFont(), LV_PART_MAIN);
+
+    gRunLogPanel = lv_obj_create(gRunScreen);
+    lv_obj_set_size(gRunLogPanel,
+                    DSP_HOR_RES - UI_SAFE_MARGIN_X * 2,
+                    DSP_VER_RES - UI_SAFE_MARGIN_Y * 2 - 170);
+    lv_obj_set_pos(gRunLogPanel, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 98);
+    lv_obj_set_style_bg_color(gRunLogPanel, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(gRunLogPanel, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(gRunLogPanel, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(gRunLogPanel, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gRunLogPanel, 12, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(gRunLogPanel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(gRunLogPanel, LV_SCROLLBAR_MODE_ACTIVE);
+
+    gRunLogLabel = lv_label_create(gRunLogPanel);
+    lv_obj_set_width(gRunLogLabel, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2 - 28);
+    lv_label_set_long_mode(gRunLogLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(gRunLogLabel, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gRunLogLabel, uiBodyFont(), LV_PART_MAIN);
+
+    gBackButton = lv_btn_create(gRunScreen);
+    lv_obj_set_size(gBackButton, 180, 54);
+    lv_obj_align(gBackButton, LV_ALIGN_BOTTOM_MID, 0, -UI_SAFE_MARGIN_Y);
+    lv_obj_add_event_cb(gBackButton, backButtonEvent, LV_EVENT_CLICKED, nullptr);
+
+    gBackLabel = lv_label_create(gBackButton);
+    lv_label_set_text(gBackLabel, "Back");
+    lv_obj_set_style_text_color(gBackLabel, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(gBackLabel, uiBodyFont(), LV_PART_MAIN);
+    lv_obj_center(gBackLabel);
+  }
+
+  const char *title = (testIndex >= 0 && testIndex < (int)menuTestCount())
+    ? kTestMenuEntries[testIndex].label
+    : "Test";
+  lv_label_set_text(gRunTitle, title);
+  lv_label_set_text(gRunStatus, completed ? "Test finished. Tap Back." : "Testing... please wait.");
+  if (!completed) {
+    clearRunLog();
+  }
+
+  if (completed) {
+    lv_obj_clear_flag(gBackButton, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(gBackButton, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  lv_screen_load(gRunScreen);
+  lv_timer_handler();
+}
+
+static void showMainMenu() {
+  if (!setupLvglIfNeeded()) {
+    return;
+  }
+
+  if (gMenuScreen == nullptr) {
+    gMenuScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(gMenuScreen, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gMenuScreen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(gMenuScreen, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gMenuScreen, 0, LV_PART_MAIN);
+
+    lv_obj_t *title = lv_label_create(gMenuScreen);
+    lv_label_set_text(title, "KODE Test Menu");
+    lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, uiTitleFont(), LV_PART_MAIN);
+    lv_obj_set_pos(title, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y - 10);
+
+    gMenuPanel = lv_obj_create(gMenuScreen);
+    lv_obj_set_size(gMenuPanel,
+                    DSP_HOR_RES - UI_SAFE_MARGIN_X * 2,
+                    DSP_VER_RES - UI_SAFE_MARGIN_Y * 2 - 18);
+    lv_obj_set_pos(gMenuPanel, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 28);
+    lv_obj_set_style_bg_color(gMenuPanel, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gMenuPanel, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(gMenuPanel, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(gMenuPanel, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(gMenuPanel, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gMenuPanel, 10, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(gMenuPanel, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(gMenuPanel, LV_SCROLLBAR_MODE_ACTIVE);
+
+    const lv_coord_t btnX = 6;
+    const lv_coord_t btnW = DSP_HOR_RES - UI_SAFE_MARGIN_X * 2 - 24;
+    const lv_coord_t btnH = 58;
+    const lv_coord_t gapY = 12;
+
+    for (size_t i = 0; i < menuTestCount(); ++i) {
+      lv_obj_t *btn = lv_btn_create(gMenuPanel);
+      lv_obj_set_size(btn, btnW, btnH);
+      lv_obj_set_pos(btn, btnX, 10 + (lv_coord_t)i * (btnH + gapY));
+      lv_obj_set_style_radius(btn, 16, LV_PART_MAIN);
+      lv_obj_add_event_cb(btn, menuButtonEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+      lv_obj_t *label = lv_label_create(btn);
+      lv_label_set_text(label, kTestMenuEntries[i].label);
+      lv_obj_set_style_text_color(label, lv_color_white(), LV_PART_MAIN);
+      lv_obj_set_style_text_font(label, uiBodyFont(), LV_PART_MAIN);
+      lv_obj_center(label);
+    }
+  }
+
+  gPendingTestIndex = -1;
+  lv_screen_load(gMenuScreen);
+  lv_timer_handler();
+}
+
+static void runPendingMenuTest() {
+  int testIndex = gPendingTestIndex;
+  if (testIndex < 0 || testIndex >= (int)menuTestCount()) {
+    gPendingTestIndex = -1;
+    return;
+  }
+
+  gPendingTestIndex = -1;
+  gTestRunning = true;
+
+  if (gGfx != nullptr) {
+    gGfx->fillScreen(0x0000);
+  }
+  showRunScreen(testIndex, false);
+  printBanner(kTestMenuEntries[testIndex].label);
+  kTestMenuEntries[testIndex].runner();
+  showRunScreen(testIndex, true);
+
+  gTestRunning = false;
 }
 
 static void lvglFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
@@ -324,15 +649,15 @@ static bool mountSdIfNeeded() {
 
 static void test1Esp32Info() {
   printBanner("[1] ESP32-S3 Info");
-  Serial.printf("ESP32 model: %s rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
-  Serial.printf("CPU cores: %d\n", ESP.getChipCores());
-  Serial.printf("Chip ID: %llu\n", ESP.getEfuseMac());
+  logBothf("ESP32 model: %s rev %d", ESP.getChipModel(), ESP.getChipRevision());
+  logBothf("CPU cores: %d", ESP.getChipCores());
+  logBothf("Chip ID: %llu", ESP.getEfuseMac());
 }
 
 static void test2IoExpander() {
   printBanner("[2] IO Expander");
   if (!setupExpander()) {
-    Serial.println("SKIP: expander not ready");
+    logBoth("SKIP: expander not ready");
     return;
   }
 
@@ -350,7 +675,7 @@ static void test2IoExpander() {
 
   for (int i = 0; i < 14; ++i) {
     int level = expanderDigitalRead(pins[i]);
-    Serial.printf("EXP%02d=%d  %s\n", pins[i], level, names[i]);
+    logBothf("EXP%02d=%d %s", pins[i], level, names[i]);
   }
 }
 
@@ -381,8 +706,8 @@ static bool setupDisplayIfNeeded() {
 static void test3DisplayAndLvgl() {
   printBanner("[3] Display + LVGL");
 
-  if (!setupDisplayIfNeeded()) {
-    Serial.println("SKIP: display unavailable");
+  if (!setupLvglIfNeeded()) {
+    logBoth("SKIP: LVGL unavailable");
     return;
   }
 
@@ -394,43 +719,9 @@ static void test3DisplayAndLvgl() {
   gGfx->print("Hello World!");
   delay(500);
 
-  // Minimal LVGL test from lvgl_test.ino
-  if (!gLvglReady) {
-    lv_init();
-    lv_tick_set_cb(lvTickMs);
-
-    ensureI2C();
-    if (gTouch.init(PIN_I2C_SDA, PIN_I2C_SCL, -1, -1, 400000) == CT_SUCCESS) {
-      gTouch.setOrientation(0, DSP_HOR_RES, DSP_VER_RES);
-      Serial.println("Touch initialized");
-    } else {
-      Serial.println("Touch init failed, continue without touch");
-    }
-
-    gLvDisplay = lv_display_create(DSP_HOR_RES, DSP_VER_RES);
-    lv_display_set_flush_cb(gLvDisplay, lvglFlushCb);
-
-    size_t drawBuf = (DSP_HOR_RES * DSP_VER_RES / 10) * (LV_COLOR_DEPTH / 8);
-    gLvBuf1 = (uint8_t *)heap_caps_malloc(drawBuf, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    gLvBuf2 = (uint8_t *)heap_caps_malloc(drawBuf, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (gLvBuf1 == nullptr || gLvBuf2 == nullptr) {
-      Serial.println("LVGL buffer allocation failed");
-      return;
-    }
-
-    lv_display_set_buffers(gLvDisplay, gLvBuf1, gLvBuf2, drawBuf, LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-    gLvIndev = lv_indev_create();
-    lv_indev_set_type(gLvIndev, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_read_cb(gLvIndev, lvglTouchReadCb);
-
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "Hello Arduino, I am LVGL!");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-
-    gLvglReady = true;
-    Serial.println("LVGL initialized");
-  }
+  lv_obj_t *label = lv_label_create(lv_screen_active());
+  lv_label_set_text(label, "LVGL OK");
+  lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
 
   uint32_t start = millis();
   while (millis() - start < 1000) {
@@ -465,7 +756,7 @@ static void test4RgbLed() {
 static void test5Buttons() {
   printBanner("[5] Buttons");
   if (!setupExpander()) {
-    Serial.println("SKIP: expander not ready");
+    logBoth("SKIP: expander not ready");
     return;
   }
 
@@ -480,21 +771,21 @@ static void test5Buttons() {
   attachInterrupt(digitalPinToInterrupt(PIN_EXP_INT), handleExpanderIRQ, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BUTTON_UP), handleButtonUpIRQ, FALLING);
 
-  Serial.println("Press buttons now (3 seconds)...");
+  logBoth("Press buttons now (3 seconds)...");
   uint32_t start = millis();
   while (millis() - start < TEST_WINDOW_MS) {
     if (gButtonUpInterrupted) {
       gButtonUpInterrupted = false;
-      Serial.println("BUTTON_UP pressed");
+      logBoth("BUTTON_UP pressed");
     }
 
     if (gExpanderInterrupted) {
       gExpanderInterrupted = false;
-      if (expanderDigitalRead(6) == LOW) Serial.println("PAD_UP pressed");
-      if (expanderDigitalRead(7) == LOW) Serial.println("PAD_LEFT pressed");
-      if (expanderDigitalRead(8) == LOW) Serial.println("PAD_DOWN pressed");
-      if (expanderDigitalRead(9) == LOW) Serial.println("BUTTON_BOTTOM pressed");
-      if (expanderDigitalRead(11) == LOW) Serial.println("PAD_RIGHT pressed");
+      if (expanderDigitalRead(6) == LOW) logBoth("PAD_UP pressed");
+      if (expanderDigitalRead(7) == LOW) logBoth("PAD_LEFT pressed");
+      if (expanderDigitalRead(8) == LOW) logBoth("PAD_DOWN pressed");
+      if (expanderDigitalRead(9) == LOW) logBoth("BUTTON_BOTTOM pressed");
+      if (expanderDigitalRead(11) == LOW) logBoth("PAD_RIGHT pressed");
     }
 
     if (gLvglReady) {
@@ -510,13 +801,13 @@ static void test5Buttons() {
 static void test6MicroSd() {
   printBanner("[6] microSD");
   if (!mountSdIfNeeded()) {
-    Serial.println("SKIP: SD card not available");
+    logBoth("SKIP: SD card not available");
     return;
   }
 
   File f = SD_MMC.open("/allinone.txt", FILE_WRITE);
   if (!f) {
-    Serial.println("Open /allinone.txt failed");
+    logBoth("Open /allinone.txt failed");
     return;
   }
   f.print("all-in-one test\n");
@@ -524,7 +815,7 @@ static void test6MicroSd() {
 
   f = SD_MMC.open("/allinone.txt");
   if (!f) {
-    Serial.println("Read /allinone.txt failed");
+    logBoth("Read /allinone.txt failed");
     return;
   }
 
@@ -535,7 +826,7 @@ static void test6MicroSd() {
   Serial.println();
   f.close();
 
-  Serial.printf("SD total=%lluMB used=%lluMB\n",
+  logBothf("SD total=%lluMB used=%lluMB",
                 SD_MMC.totalBytes() / (1024ULL * 1024ULL),
                 SD_MMC.usedBytes() / (1024ULL * 1024ULL));
 }
@@ -562,20 +853,20 @@ static void test7Audio() {
   printBanner("[7] Audio (speaker + microphone)");
 
   if (!setupExpander()) {
-    Serial.println("Expander missing, speaker amplifier may stay disabled");
+    logBoth("Expander missing, speaker amplifier may stay disabled");
   } else {
     expanderPinMode(3, OUTPUT);
     expanderDigitalWrite(3, HIGH);
   }
 
   if (!beginI2STx()) {
-    Serial.println("SKIP: I2S TX init failed");
+    logBoth("SKIP: I2S TX init failed");
   } else {
     const int frequency = 300;
     int32_t sample = 500;
     int count = 0;
 
-    Serial.println("Playing 2s square wave...");
+    logBoth("Playing 2s square wave...");
     uint32_t start = millis();
     while (millis() - start < 2000) {
       if (count % (48000 / (2 * frequency)) == 0) {
@@ -589,9 +880,9 @@ static void test7Audio() {
   }
 
   if (!beginI2SMonitor()) {
-    Serial.println("SKIP: I2S monitor init failed");
+    logBoth("SKIP: I2S monitor init failed");
   } else {
-    Serial.println("Live monitor: microphone to speaker (3s)...");
+    logBoth("Live monitor: microphone to speaker (3s)...");
     gI2S.setTimeout(10);
 
     uint32_t start = millis();
@@ -612,32 +903,32 @@ static void test7Audio() {
     }
 
     gI2S.end();
-    Serial.printf("Live monitor finished, frames=%u\n", (unsigned int)frames);
+    logBothf("Live monitor finished, frames=%u", (unsigned int)frames);
   }
 
   if (!mountSdIfNeeded()) {
-    Serial.println("SKIP: audio record (no SD card)");
+    logBoth("SKIP: audio record (no SD card)");
     return;
   }
 
   if (!beginI2SRx()) {
-    Serial.println("SKIP: I2S RX init failed");
+    logBoth("SKIP: I2S RX init failed");
     return;
   }
 
-  Serial.println("Recording 3s to /allinone_mic.wav ...");
+  logBoth("Recording 3s to /allinone_mic.wav ...");
   size_t wavSize = 0;
   uint8_t *wavBuffer = gI2S.recordWAV(3, &wavSize);
   gI2S.end();
 
   if (wavBuffer == nullptr || wavSize == 0) {
-    Serial.println("Record failed");
+    logBoth("Record failed");
     return;
   }
 
   File wav = SD_MMC.open("/allinone_mic.wav", FILE_WRITE);
   if (!wav) {
-    Serial.println("Failed to open /allinone_mic.wav");
+    logBoth("Failed to open /allinone_mic.wav");
     free(wavBuffer);
     return;
   }
@@ -646,7 +937,7 @@ static void test7Audio() {
   wav.close();
   free(wavBuffer);
 
-  Serial.printf("WAV write: %u/%u bytes\n", (unsigned int)written, (unsigned int)wavSize);
+  logBothf("WAV write: %u/%u bytes", (unsigned int)written, (unsigned int)wavSize);
 }
 
 static void test8ImuAndMag() {
@@ -659,28 +950,28 @@ static void test8ImuAndMag() {
     sensors_event_t temp;
     gImu.getEvent(&accel, &gyro, &temp);
 
-    Serial.printf("IMU temp=%.2f C\n", temp.temperature);
-    Serial.printf("IMU accel x=%.2f y=%.2f z=%.2f m/s^2\n",
+    logBothf("IMU temp=%.2f C", temp.temperature);
+    logBothf("ACC x=%.2f y=%.2f z=%.2f",
                   accel.acceleration.x,
                   accel.acceleration.y,
                   accel.acceleration.z);
-    Serial.printf("IMU gyro  x=%.2f y=%.2f z=%.2f rad/s\n",
+    logBothf("GYR x=%.2f y=%.2f z=%.2f",
                   gyro.gyro.x,
                   gyro.gyro.y,
                   gyro.gyro.z);
   } else {
-    Serial.println("IMU not found");
+    logBoth("IMU not found");
   }
 
   if (gMag.begin()) {
     sensors_event_t magEvent;
     gMag.getEvent(&magEvent);
-    Serial.printf("MAG x=%.2f y=%.2f z=%.2f uT\n",
+    logBothf("MAG x=%.2f y=%.2f z=%.2f uT",
                   magEvent.magnetic.x,
                   magEvent.magnetic.y,
                   magEvent.magnetic.z);
   } else {
-    Serial.println("Magnetometer not found");
+    logBoth("Magnetometer not found");
   }
 }
 
@@ -700,16 +991,16 @@ static void test9Rtc() {
   gRtc.t.dayOfWeek = 6;
 
   if (!gRtc.writeTime()) {
-    Serial.println("RTC writeTime failed");
+    logBoth("RTC writeTime failed");
     return;
   }
 
   if (!gRtc.readTime()) {
-    Serial.println("RTC readTime failed");
+    logBoth("RTC readTime failed");
     return;
   }
 
-  Serial.printf("RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+  logBothf("RTC: %04d-%02d-%02d %02d:%02d:%02d",
                 gRtc.t.year, gRtc.t.month, gRtc.t.day,
                 gRtc.t.hour, gRtc.t.minute, gRtc.t.second);
 }
@@ -722,17 +1013,17 @@ static void test10Power() {
   delay(100);
 
   if (gPmic.isConnected()) {
-    Serial.println("PMIC BQ25896 connected");
-    Serial.printf("VBUSV=%d mV, BATV=%d mV, SYSV=%d mV\n",
+    logBoth("PMIC BQ25896 connected");
+    logBothf("VBUS=%d BAT=%d SYS=%d mV",
                   gPmic.getVBUSV(),
                   gPmic.getBATV(),
                   gPmic.getSYSV());
-    Serial.printf("ICHGR=%d mA, IINLIM=%d mA\n",
+    logBothf("ICHG=%d IINLIM=%d mA",
                   gPmic.getICHGR(),
                   gPmic.getIINLIM());
     gPmic.setCONV_START(true);
   } else {
-    Serial.println("PMIC BQ25896 not found");
+    logBoth("PMIC BQ25896 not found");
   }
 
   if (gGauge.begin()) {
@@ -741,12 +1032,12 @@ static void test10Power() {
     int ma = gGauge.readCurrentMilliamps();
     float tC = gGauge.readTemperatureCelsius();
 
-    Serial.printf("BQ27220 SOC=%d%% V=%d mV I=%d mA T=%.1f C\n", soc, mv, ma, tC);
+    logBothf("BQ27220 SOC=%d%% V=%d I=%d T=%.1fC", soc, mv, ma, tC);
     if (ma > 0) {
-      Serial.printf("BQ27220 TTF=%d min\n", gGauge.readTimeToFullMinutes());
+      logBothf("BQ27220 TTF=%d min", gGauge.readTimeToFullMinutes());
     }
   } else {
-    Serial.println("BQ27220 not found");
+    logBoth("BQ27220 not found");
   }
 }
 
@@ -758,48 +1049,20 @@ void setup() {
   if (gGfx != nullptr) {
     gGfx->fillScreen(0x0000);
     gScreenLogLine = 0;
-    screenLog("KODE all-in-one test");
+    screenLog("KODE test menu");
   }
 
-  printBanner("KODE all-in-one test start");
-  screenLog("Start all tests");
-
-  test1Esp32Info();
-  screenLog("[DONE] 1 ESP32 info");
-  test2IoExpander();
-  screenLog("[DONE] 2 IO expander");
-  test4RgbLed();
-  screenLog("[DONE] 4 RGB LED");
-  test5Buttons();
-  screenLog("[DONE] 5 Buttons");
-  test6MicroSd();
-  screenLog("[DONE] 6 microSD");
-  test7Audio();
-  screenLog("[DONE] 7 Audio");
-  test3DisplayAndLvgl();
-  screenLog("[DONE] 3 Display+LVGL");
-  test8ImuAndMag();
-  screenLog("[DONE] 8 IMU+MAG");
-  test9Rtc();
-  screenLog("[DONE] 9 RTC");
-  test10Power();
-  screenLog("[DONE] 10 Power");
-
-  printBanner("All tests finished");
-  Serial.println("Loop keeps LVGL alive and prints heartbeat every 5s.");
-  screenLog("All tests finished");
+  printBanner("KODE test menu ready");
+  showMainMenu();
 }
 
 void loop() {
-  static uint32_t lastHeartbeat = 0;
+  if (gPendingTestIndex >= 0 && !gTestRunning) {
+    runPendingMenuTest();
+  }
 
   if (gLvglReady) {
     lv_timer_handler();
-  }
-
-  if (millis() - lastHeartbeat > 5000) {
-    lastHeartbeat = millis();
-    logBoth("all-in-one running...");
   }
 
   delay(5);
