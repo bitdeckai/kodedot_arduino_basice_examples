@@ -76,10 +76,12 @@ static lv_display_t *gLvDisplay = nullptr;
 static lv_indev_t *gLvIndev = nullptr;
 static uint8_t *gLvBuf1 = nullptr;
 static uint8_t *gLvBuf2 = nullptr;
+static bool gI2cReady = false;
 static bool gLvglReady = false;
 static bool gTouchReady = false;
 static bool gSdMounted = false;
 static bool gExpanderReady = false;
+static bool gMenuKeysReady = false;
 static uint16_t gExpanderOutput = 0x0000;
 static uint16_t gExpanderConfig = 0xFFFF;
 static int gScreenLogLine = 0;
@@ -88,6 +90,11 @@ static const int SCREEN_LOG_MARGIN = 8;
 static const int UI_SAFE_MARGIN_X = 28;
 static const int UI_SAFE_MARGIN_Y = 34;
 static const int UI_LOG_BUFFER_SIZE = 4096;
+static const int UI_SCALE_MENU_TITLE = 384;
+static const int UI_SCALE_MENU_BUTTON_TEXT = 320;
+static const int UI_SCALE_RUN_TITLE = 384;
+static const int UI_SCALE_RUN_STATUS = 512;
+static const int UI_SCALE_RUN_LOG = 512;
 
 typedef void (*TestMenuRunner)();
 
@@ -122,6 +129,7 @@ static const TestMenuEntry kTestMenuEntries[] = {
 
 static lv_obj_t *gMenuScreen = nullptr;
 static lv_obj_t *gMenuPanel = nullptr;
+static lv_obj_t *gMenuButtons[10] = {nullptr};
 static lv_obj_t *gRunScreen = nullptr;
 static lv_obj_t *gRunTitle = nullptr;
 static lv_obj_t *gRunStatus = nullptr;
@@ -129,9 +137,18 @@ static lv_obj_t *gRunLogPanel = nullptr;
 static lv_obj_t *gRunLogLabel = nullptr;
 static lv_obj_t *gBackButton = nullptr;
 static lv_obj_t *gBackLabel = nullptr;
+static int gMenuSelectedIndex = 0;
 static int gPendingTestIndex = -1;
 static bool gTestRunning = false;
 static char gRunLogText[UI_LOG_BUFFER_SIZE] = {0};
+static uint32_t gLastMenuNavMs = 0;
+static bool gMenuUpPrev = false;
+static bool gMenuDownPrev = false;
+static bool gMenuSelectPrev = false;
+static bool gMenuBackPrev = false;
+static uint32_t gSingleButtonPressStartMs = 0;
+static bool gSingleButtonLongHandled = false;
+static bool gSingleButtonModeLogged = false;
 
 static bool setupLvglIfNeeded();
 static void showMainMenu();
@@ -139,6 +156,9 @@ static void showRunScreen(int testIndex, bool completed);
 static void menuButtonEvent(lv_event_t *e);
 static void backButtonEvent(lv_event_t *e);
 static void runPendingMenuTest();
+static bool setupMenuKeysIfNeeded();
+static void refreshMenuSelection();
+static void handleMenuInputFallback();
 static const lv_font_t *uiTitleFont();
 static const lv_font_t *uiBodyFont();
 static void clearRunLog();
@@ -190,6 +210,133 @@ static void appendRunLogLine(const char *msg) {
   strncat(gRunLogText, msg, UI_LOG_BUFFER_SIZE - strlen(gRunLogText) - 1);
   lv_label_set_text(gRunLogLabel, gRunLogText);
   lv_obj_scroll_to_y(gRunLogPanel, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+static void refreshMenuSelection() {
+  for (size_t i = 0; i < menuTestCount(); ++i) {
+    lv_obj_t *btn = gMenuButtons[i];
+    if (btn == nullptr) {
+      continue;
+    }
+
+    if ((int)i == gMenuSelectedIndex) {
+      lv_obj_set_style_bg_color(btn, lv_palette_main(LV_PALETTE_ORANGE), LV_PART_MAIN);
+      lv_obj_set_style_border_color(btn, lv_color_white(), LV_PART_MAIN);
+      lv_obj_set_style_shadow_width(btn, 16, LV_PART_MAIN);
+    } else {
+      lv_obj_set_style_bg_color(btn, lv_palette_darken(LV_PALETTE_TEAL, 3), LV_PART_MAIN);
+      lv_obj_set_style_border_color(btn, lv_palette_lighten(LV_PALETTE_AMBER, 2), LV_PART_MAIN);
+      lv_obj_set_style_shadow_width(btn, 10, LV_PART_MAIN);
+    }
+  }
+
+  if (gMenuSelectedIndex >= 0 && gMenuSelectedIndex < (int)menuTestCount() && gMenuButtons[gMenuSelectedIndex] != nullptr) {
+    lv_obj_scroll_to_view(gMenuButtons[gMenuSelectedIndex], LV_ANIM_OFF);
+  }
+}
+
+static bool setupMenuKeysIfNeeded() {
+  if (gMenuKeysReady) {
+    return true;
+  }
+
+  pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
+
+  if (setupExpander()) {
+    expanderPinMode(6, INPUT);
+    expanderPinMode(7, INPUT);
+    expanderPinMode(8, INPUT);
+    expanderPinMode(9, INPUT);
+    expanderPinMode(11, INPUT);
+    Serial.println("Menu key fallback ready");
+  } else {
+    Serial.println("Menu key fallback limited: expander unavailable");
+  }
+
+  gMenuKeysReady = true;
+  return true;
+}
+
+static void handleMenuInputFallback() {
+  setupMenuKeysIfNeeded();
+
+  bool gpioButtonNow = digitalRead(PIN_BUTTON_UP) == LOW;
+  if (!gExpanderReady) {
+    if (!gSingleButtonModeLogged) {
+      Serial.println("Single-button menu mode: short press=next, long press=enter/back");
+      gSingleButtonModeLogged = true;
+    }
+
+    if (gpioButtonNow && !gMenuUpPrev) {
+      gSingleButtonPressStartMs = millis();
+      gSingleButtonLongHandled = false;
+    }
+
+    if (gpioButtonNow && !gSingleButtonLongHandled && millis() - gSingleButtonPressStartMs >= 700) {
+      gSingleButtonLongHandled = true;
+      if (!gTestRunning && lv_screen_active() == gMenuScreen) {
+        gPendingTestIndex = gMenuSelectedIndex;
+      } else if (!gTestRunning && lv_screen_active() == gRunScreen) {
+        if (gBackButton != nullptr && !lv_obj_has_flag(gBackButton, LV_OBJ_FLAG_HIDDEN)) {
+          showMainMenu();
+        }
+      }
+      gLastMenuNavMs = millis();
+    }
+
+    if (!gpioButtonNow && gMenuUpPrev) {
+      uint32_t pressMs = millis() - gSingleButtonPressStartMs;
+      if (!gSingleButtonLongHandled && pressMs >= 30) {
+        if (!gTestRunning && lv_screen_active() == gMenuScreen) {
+          gMenuSelectedIndex = (gMenuSelectedIndex + 1) % (int)menuTestCount();
+          refreshMenuSelection();
+          gLastMenuNavMs = millis();
+        }
+      }
+    }
+
+    gMenuUpPrev = gpioButtonNow;
+    gMenuDownPrev = false;
+    gMenuSelectPrev = false;
+    gMenuBackPrev = false;
+    return;
+  }
+
+  gSingleButtonModeLogged = false;
+
+  bool upNow = gpioButtonNow || expanderDigitalRead(6) == LOW;
+  bool downNow = gExpanderReady && expanderDigitalRead(8) == LOW;
+  bool selectNow = gExpanderReady && (expanderDigitalRead(9) == LOW || expanderDigitalRead(11) == LOW);
+  bool backNow = gExpanderReady && expanderDigitalRead(7) == LOW;
+
+  bool canTrigger = millis() - gLastMenuNavMs >= 160;
+
+  if (!gTestRunning && lv_screen_active() == gMenuScreen) {
+    if (canTrigger && upNow && !gMenuUpPrev) {
+      gMenuSelectedIndex = (gMenuSelectedIndex - 1 + (int)menuTestCount()) % (int)menuTestCount();
+      refreshMenuSelection();
+      gLastMenuNavMs = millis();
+    } else if (canTrigger && downNow && !gMenuDownPrev) {
+      gMenuSelectedIndex = (gMenuSelectedIndex + 1) % (int)menuTestCount();
+      refreshMenuSelection();
+      gLastMenuNavMs = millis();
+    } else if (canTrigger && selectNow && !gMenuSelectPrev) {
+      gPendingTestIndex = gMenuSelectedIndex;
+      gLastMenuNavMs = millis();
+    }
+  } else if (!gTestRunning && lv_screen_active() == gRunScreen) {
+    if (gBackButton != nullptr && !lv_obj_has_flag(gBackButton, LV_OBJ_FLAG_HIDDEN)) {
+      if (canTrigger && ((selectNow && !gMenuSelectPrev) || (backNow && !gMenuBackPrev) || (upNow && !gMenuUpPrev))) {
+        showMainMenu();
+        gLastMenuNavMs = millis();
+      }
+    }
+  }
+
+  gMenuUpPrev = upNow;
+  gMenuDownPrev = downNow;
+  gMenuSelectPrev = selectNow;
+  gMenuBackPrev = backNow;
 }
 
 static void screenLog(const char *msg) {
@@ -275,10 +422,10 @@ static bool setupLvglIfNeeded() {
   if (gTouch.init(PIN_I2C_SDA, PIN_I2C_SCL, -1, -1, 400000) == CT_SUCCESS) {
     gTouch.setOrientation(0, DSP_HOR_RES, DSP_VER_RES);
     gTouchReady = true;
-    Serial.println("Touch initialized");
+    Serial.printf("Touch initialized, type=%d\n", gTouch.sensorType());
   } else {
     gTouchReady = false;
-    Serial.println("Touch init failed, continue without touch");
+    Serial.println("Touch init failed, buttons fallback active");
   }
 
   gLvDisplay = lv_display_create(DSP_HOR_RES, DSP_VER_RES);
@@ -308,7 +455,9 @@ static void menuButtonEvent(lv_event_t *e) {
     return;
   }
 
-  gPendingTestIndex = (int)(intptr_t)lv_event_get_user_data(e);
+  gMenuSelectedIndex = (int)(intptr_t)lv_event_get_user_data(e);
+  refreshMenuSelection();
+  gPendingTestIndex = gMenuSelectedIndex;
 }
 
 static void backButtonEvent(lv_event_t *e) {
@@ -336,41 +485,58 @@ static void showRunScreen(int testIndex, bool completed) {
     lv_obj_set_pos(gRunTitle, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y);
     lv_obj_set_style_text_color(gRunTitle, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(gRunTitle, uiTitleFont(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(gRunTitle, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_x(gRunTitle, (DSP_HOR_RES - UI_SAFE_MARGIN_X * 2) / 2, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(gRunTitle, 0, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(gRunTitle, UI_SCALE_RUN_TITLE, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(gRunTitle, UI_SCALE_RUN_TITLE, LV_PART_MAIN);
 
     gRunStatus = lv_label_create(gRunScreen);
     lv_obj_set_width(gRunStatus, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2);
-    lv_obj_set_pos(gRunStatus, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 54);
-    lv_obj_set_style_text_color(gRunStatus, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_pos(gRunStatus, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 76);
+    lv_obj_set_style_text_color(gRunStatus, lv_palette_main(LV_PALETTE_AMBER), LV_PART_MAIN);
     lv_obj_set_style_text_font(gRunStatus, uiBodyFont(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(gRunStatus, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(gRunStatus, UI_SCALE_RUN_STATUS, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(gRunStatus, UI_SCALE_RUN_STATUS, LV_PART_MAIN);
 
     gRunLogPanel = lv_obj_create(gRunScreen);
     lv_obj_set_size(gRunLogPanel,
                     DSP_HOR_RES - UI_SAFE_MARGIN_X * 2,
-                    DSP_VER_RES - UI_SAFE_MARGIN_Y * 2 - 170);
-    lv_obj_set_pos(gRunLogPanel, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 98);
-    lv_obj_set_style_bg_color(gRunLogPanel, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_border_color(gRunLogPanel, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_border_width(gRunLogPanel, 1, LV_PART_MAIN);
+            DSP_VER_RES - UI_SAFE_MARGIN_Y * 2 - 206);
+    lv_obj_set_pos(gRunLogPanel, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 140);
+    lv_obj_set_style_bg_color(gRunLogPanel, lv_palette_darken(LV_PALETTE_GREY, 4), LV_PART_MAIN);
+    lv_obj_set_style_border_color(gRunLogPanel, lv_palette_main(LV_PALETTE_ORANGE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(gRunLogPanel, 2, LV_PART_MAIN);
     lv_obj_set_style_radius(gRunLogPanel, 18, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(gRunLogPanel, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gRunLogPanel, 16, LV_PART_MAIN);
     lv_obj_set_scroll_dir(gRunLogPanel, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(gRunLogPanel, LV_SCROLLBAR_MODE_ACTIVE);
 
     gRunLogLabel = lv_label_create(gRunLogPanel);
-    lv_obj_set_width(gRunLogLabel, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2 - 28);
+    lv_obj_set_width(gRunLogLabel, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2 - 36);
     lv_label_set_long_mode(gRunLogLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(gRunLogLabel, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(gRunLogLabel, lv_palette_lighten(LV_PALETTE_ORANGE, 4), LV_PART_MAIN);
     lv_obj_set_style_text_font(gRunLogLabel, uiBodyFont(), LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(gRunLogLabel, 10, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(gRunLogLabel, UI_SCALE_RUN_LOG, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(gRunLogLabel, UI_SCALE_RUN_LOG, LV_PART_MAIN);
 
     gBackButton = lv_btn_create(gRunScreen);
-    lv_obj_set_size(gBackButton, 180, 54);
+    lv_obj_set_size(gBackButton, 210, 64);
     lv_obj_align(gBackButton, LV_ALIGN_BOTTOM_MID, 0, -UI_SAFE_MARGIN_Y);
+    lv_obj_set_style_bg_color(gBackButton, lv_palette_main(LV_PALETTE_DEEP_ORANGE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gBackButton, lv_palette_darken(LV_PALETTE_DEEP_ORANGE, 2), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(gBackButton, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(gBackButton, 18, LV_PART_MAIN);
     lv_obj_add_event_cb(gBackButton, backButtonEvent, LV_EVENT_CLICKED, nullptr);
 
     gBackLabel = lv_label_create(gBackButton);
     lv_label_set_text(gBackLabel, "Back");
     lv_obj_set_style_text_color(gBackLabel, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(gBackLabel, uiBodyFont(), LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(gBackLabel, UI_SCALE_MENU_BUTTON_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(gBackLabel, UI_SCALE_MENU_BUTTON_TEXT, LV_PART_MAIN);
     lv_obj_center(gBackLabel);
   }
 
@@ -407,44 +573,65 @@ static void showMainMenu() {
 
     lv_obj_t *title = lv_label_create(gMenuScreen);
     lv_label_set_text(title, "KODE Test Menu");
-    lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_width(title, DSP_HOR_RES - UI_SAFE_MARGIN_X * 2);
+    lv_obj_set_style_text_color(title, lv_palette_lighten(LV_PALETTE_ORANGE, 3), LV_PART_MAIN);
     lv_obj_set_style_text_font(title, uiTitleFont(), LV_PART_MAIN);
-    lv_obj_set_pos(title, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y - 10);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_x(title, (DSP_HOR_RES - UI_SAFE_MARGIN_X * 2) / 2, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(title, 0, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(title, UI_SCALE_MENU_TITLE, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(title, UI_SCALE_MENU_TITLE, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, UI_SAFE_MARGIN_Y - 8);
 
     gMenuPanel = lv_obj_create(gMenuScreen);
     lv_obj_set_size(gMenuPanel,
                     DSP_HOR_RES - UI_SAFE_MARGIN_X * 2,
                     DSP_VER_RES - UI_SAFE_MARGIN_Y * 2 - 18);
     lv_obj_set_pos(gMenuPanel, UI_SAFE_MARGIN_X, UI_SAFE_MARGIN_Y + 28);
-    lv_obj_set_style_bg_color(gMenuPanel, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gMenuPanel, lv_palette_darken(LV_PALETTE_GREY, 4), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(gMenuPanel, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(gMenuPanel, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_border_width(gMenuPanel, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(gMenuPanel, lv_palette_main(LV_PALETTE_ORANGE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(gMenuPanel, 2, LV_PART_MAIN);
     lv_obj_set_style_radius(gMenuPanel, 18, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(gMenuPanel, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gMenuPanel, 12, LV_PART_MAIN);
     lv_obj_set_scroll_dir(gMenuPanel, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(gMenuPanel, LV_SCROLLBAR_MODE_ACTIVE);
 
-    const lv_coord_t btnX = 6;
     const lv_coord_t btnW = DSP_HOR_RES - UI_SAFE_MARGIN_X * 2 - 24;
-    const lv_coord_t btnH = 58;
-    const lv_coord_t gapY = 12;
+    const lv_coord_t btnH = 72;
+    const lv_coord_t gapY = 14;
 
     for (size_t i = 0; i < menuTestCount(); ++i) {
       lv_obj_t *btn = lv_btn_create(gMenuPanel);
+      gMenuButtons[i] = btn;
       lv_obj_set_size(btn, btnW, btnH);
-      lv_obj_set_pos(btn, btnX, 10 + (lv_coord_t)i * (btnH + gapY));
-      lv_obj_set_style_radius(btn, 16, LV_PART_MAIN);
+      lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 10 + (lv_coord_t)i * (btnH + gapY));
+      lv_obj_set_style_radius(btn, 20, LV_PART_MAIN);
+      lv_obj_set_style_bg_color(btn, lv_palette_darken(LV_PALETTE_TEAL, 3), LV_PART_MAIN);
+      lv_obj_set_style_bg_color(btn, lv_palette_main(LV_PALETTE_TEAL), LV_STATE_PRESSED);
+      lv_obj_set_style_border_color(btn, lv_palette_lighten(LV_PALETTE_AMBER, 2), LV_PART_MAIN);
+      lv_obj_set_style_border_width(btn, 2, LV_PART_MAIN);
+      lv_obj_set_style_shadow_width(btn, 10, LV_PART_MAIN);
+      lv_obj_set_style_shadow_color(btn, lv_palette_darken(LV_PALETTE_TEAL, 4), LV_PART_MAIN);
       lv_obj_add_event_cb(btn, menuButtonEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
       lv_obj_t *label = lv_label_create(btn);
       lv_label_set_text(label, kTestMenuEntries[i].label);
+  lv_obj_set_width(label, btnW - 32);
       lv_obj_set_style_text_color(label, lv_color_white(), LV_PART_MAIN);
       lv_obj_set_style_text_font(label, uiBodyFont(), LV_PART_MAIN);
+  lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_style_transform_pivot_x(label, (btnW - 32) / 2, LV_PART_MAIN);
+  lv_obj_set_style_transform_pivot_y(label, 0, LV_PART_MAIN);
+      lv_obj_set_style_transform_scale_x(label, UI_SCALE_MENU_BUTTON_TEXT, LV_PART_MAIN);
+      lv_obj_set_style_transform_scale_y(label, UI_SCALE_MENU_BUTTON_TEXT, LV_PART_MAIN);
       lv_obj_center(label);
     }
+
+    refreshMenuSelection();
   }
 
+  refreshMenuSelection();
   gPendingTestIndex = -1;
   lv_screen_load(gMenuScreen);
   lv_timer_handler();
@@ -490,6 +677,11 @@ static void lvglFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_m
 
 static void lvglTouchReadCb(lv_indev_t *indev, lv_indev_data_t *data) {
   (void)indev;
+  if (!gTouchReady) {
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
+
   TOUCHINFO ti;
   if (gTouch.getSamples(&ti) && ti.count > 0) {
     data->state = LV_INDEV_STATE_PRESSED;
@@ -501,10 +693,9 @@ static void lvglTouchReadCb(lv_indev_t *indev, lv_indev_data_t *data) {
 }
 
 static void ensureI2C() {
-  static bool initialized = false;
-  if (!initialized) {
+  if (!gI2cReady) {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    initialized = true;
+    gI2cReady = true;
     Serial.println("I2C initialized on GPIO48/GPIO47");
   }
 }
@@ -1059,6 +1250,10 @@ void setup() {
 void loop() {
   if (gPendingTestIndex >= 0 && !gTestRunning) {
     runPendingMenuTest();
+  }
+
+  if (gLvglReady && !gTouchReady) {
+    handleMenuInputFallback();
   }
 
   if (gLvglReady) {
